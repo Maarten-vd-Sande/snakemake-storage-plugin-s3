@@ -151,6 +151,8 @@ class StorageProvider(StorageProviderBase):
                 },
             ),
         )
+        # to keep track of known existing buckets
+        self._existing_buckets: set[str] = set()
 
     @classmethod
     def example_queries(cls) -> List[ExampleQuery]:
@@ -241,29 +243,54 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         information as possible. Only retrieve that information that comes for free
         given the current object.
         """
+        # Top-level keys are skipped, since their listing would be the whole
+        # bucket (see #24).
+        prefix = self.get_inventory_parent()
+        if not prefix:
+            return
+
+        # make sure the prefix includes trailing slash
+        prefix = f"{prefix}/"
+
         # If this is implemented in a storage object, results have to be stored in
         # the given IOCache object.
-
-        if self.get_inventory_parent() in cache.exists_in_storage:
-            # bucket has been inventorized before, stop here
+        if self._is_inventorized(prefix, cache):
             return
 
         if not self.bucket_exists():
             cache.exists_in_storage[self.cache_key()] = False
             return
 
-        cache.exists_in_storage[self.get_inventory_parent()] = True
-        prefix = os.path.dirname(self.key)
-        if prefix:
-            for obj in self.s3bucket().objects.filter(Prefix=prefix):
-                key = self.cache_key(self._local_suffix_from_key(obj.key))
-                cache.mtime[key] = Mtime(storage=obj.last_modified.timestamp())
-                cache.size[key] = obj.size
-                cache.exists_in_storage[key] = True
+        for obj in self.s3bucket().objects.filter(Prefix=prefix):
+            key = self.cache_key(self._local_suffix_from_key(obj.key))
+            cache.mtime[key] = Mtime(storage=obj.last_modified.timestamp())
+            cache.size[key] = obj.size
+            cache.exists_in_storage[key] = True
+        cache.exists_in_storage[self._inventory_marker(prefix)] = True
+
+    def _inventory_marker(self, prefix: str) -> str:
+        """Return the IOCache key recording that the given prefix has been listed."""
+        return "s3-inventory:" + self.cache_key(self._local_suffix_from_key(prefix))
+
+    def _is_inventorized(self, prefix: str, cache: IOCacheStorageInterface) -> bool:
+        """Check if the given prefix has been inventorized before."""
+        if self._inventory_marker(prefix) in cache.exists_in_storage:
+            return True
+
+        # now check if any of the parents have already been inventorized
+        # parts: "folder/subfolder/subsubfolder/" -> ["folder", "subfolder", "subsubfolder"]
+        parts = prefix.rstrip("/").split("/")
+        # parents: ["folder/", "folder/subfolder/]
+        parents = ["/".join(parts[:i]) + "/" for i in range(1, len(parts))]  # -> ["d1/", "d1/sub/"]
+        for parent in parents:
+            if self._inventory_marker(parent) in cache.exists_in_storage:
+                return True
+
+        return False
 
     def get_inventory_parent(self) -> Optional[str]:
         """Return the parent directory of this object."""
-        return self.cache_key(self.bucket)
+        return posixpath.dirname(self.key)
 
     def local_suffix(self) -> str:
         return self._local_suffix
@@ -353,6 +380,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
                     "LocationConstraint": self.provider.settings.region
                 }
             self.provider.s3c.create_bucket(**create_bucket_params)
+            self.provider._existing_buckets.add(self.bucket)
 
         if self.local_path().is_dir():
             self._is_dir = True
@@ -374,6 +402,7 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         # check if bucket is empty and remove it if so
         if not any(self.s3bucket().objects.all()):
             self.s3bucket().delete()
+            self.provider._existing_buckets.discard(self.bucket)
 
     @retry_decorator
     def list_candidate_matches(self) -> Iterable[str]:
@@ -392,8 +421,11 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
             )
 
     def bucket_exists(self):
+        if self.bucket in self.provider._existing_buckets:
+            return True
         try:
             self.provider.s3c.meta.client.head_bucket(Bucket=self.bucket)
-            return True
         except Exception:
             return False
+        self.provider._existing_buckets.add(self.bucket)
+        return True
