@@ -153,6 +153,39 @@ class StorageProvider(StorageProviderBase):
         )
         # to keep track of known existing buckets
         self._existing_buckets: set[str] = set()
+        # Snakemake's IOCache, as passed to inventory()
+        # (see StorageObject._active_iocache())
+        self._iocache: Optional[IOCacheStorageInterface] = None
+
+    @property
+    def iocache(self):
+        if self._iocache and getattr(self._iocache, "active", False):
+            return self._iocache
+        return None
+
+    @iocache.setter
+    def iocache(self, iocache: IOCacheStorageInterface):
+        self._iocache = iocache
+
+    def _is_inventorized(self, obj: "StorageObject") -> bool:
+        """Check if the given prefix has been inventorized before."""
+        prefix = posixpath.dirname(obj.key)
+        if not prefix:
+            return False
+
+        if obj._inventory_marker(prefix) in self.iocache.exists_in_storage:
+            return True
+
+        # now check if any of the parents have already been inventorized
+        # parts: "folder/sub/subsub/" -> ["folder", "sub", "subsub"]
+        parts = prefix.rstrip("/").split("/")
+        # parents: ["folder/", "folder/sub/"]
+        parents = ["/".join(parts[:i]) + "/" for i in range(1, len(parts))]
+        for parent in parents:
+            if obj._inventory_marker(parent) in self.iocache.exists_in_storage:
+                return True
+
+        return False
 
     @classmethod
     def example_queries(cls) -> List[ExampleQuery]:
@@ -243,18 +276,30 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
         information as possible. Only retrieve that information that comes for free
         given the current object.
         """
-        # Top-level keys are skipped, since their listing would be the whole
-        # bucket (see #24).
-        prefix = self.get_inventory_parent()
+        self.provider.iocache = cache
+        self._inventory()
+
+    @property
+    def prefix(self):
+        """Get the prefix of this object with a trailing slash"""
+        prefix = posixpath.dirname(self.key)
         if not prefix:
             return
 
-        # make sure the prefix includes trailing slash
+        # the trailing slash keeps siblings like data_old/ out of a listing of data/
         prefix = f"{prefix}/"
+        return prefix
 
-        # If this is implemented in a storage object, results have to be stored in
-        # the given IOCache object.
-        if self._is_inventorized(prefix, cache):
+    def _inventory(self):
+        # top-level keys are skipped,
+        # since their listing would be the whole bucket (see #24).
+        cache = self.provider.iocache
+        prefix = self.prefix
+        if not prefix:
+            return
+
+        if self.provider._is_inventorized(self):
+            # no need to make an inventory if it's already dnoe
             return
 
         if not self.bucket_exists():
@@ -263,34 +308,50 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
         for obj in self.s3bucket().objects.filter(Prefix=prefix):
             key = self.cache_key(self._local_suffix_from_key(obj.key))
-            cache.mtime[key] = Mtime(storage=obj.last_modified.timestamp())
-            cache.size[key] = obj.size
             cache.exists_in_storage[key] = True
+
+            # folder objects (keys ending with "/") say nothing about
+            # the mtime or size of the folder
+            # more annoyingly, an object's key can actually end with "/"
+            if not obj.key.endswith("/"):
+                cache.mtime[key] = Mtime(storage=obj.last_modified.timestamp())
+                cache.size[key] = obj.size
+
+            # S3 has no real folders: a key implies all folders above it
+            # if our key is folder/
+            parent = posixpath.dirname(obj.key.rstrip("/"))
+            while parent.startswith(prefix):
+                parent_key = self.cache_key(self._local_suffix_from_key(parent))
+                cache.exists_in_storage[parent_key] = True
+                parent = posixpath.dirname(parent)
         cache.exists_in_storage[self._inventory_marker(prefix)] = True
+
+        # the listing contains everything below the folder, so anything that is not
+        # in it does not exist
+        cache.exists_in_storage.setdefault(self.cache_key(), False)
 
     def _inventory_marker(self, prefix: str) -> str:
         """Return the IOCache key recording that the given prefix has been listed."""
         return "s3-inventory:" + self.cache_key(self._local_suffix_from_key(prefix))
 
-    def _is_inventorized(self, prefix: str, cache: IOCacheStorageInterface) -> bool:
-        """Check if the given prefix has been inventorized before."""
-        if self._inventory_marker(prefix) in cache.exists_in_storage:
-            return True
+    def _get_cache(self) -> Optional[IOCacheStorageInterface]:
+        """Return the IOCache for this object, if the cache is active and can cover the object, else None.
 
-        # now check if any of the parents have already been inventorized
-        # parts: "folder/subfolder/subsubfolder/" -> ["folder", "subfolder", "subsubfolder"]
-        parts = prefix.rstrip("/").split("/")
-        # parents: ["folder/", "folder/subfolder/]
-        parents = ["/".join(parts[:i]) + "/" for i in range(1, len(parts))]  # -> ["d1/", "d1/sub/"]
-        for parent in parents:
-            if self._inventory_marker(parent) in cache.exists_in_storage:
-                return True
+        Will inventorize the "folder" this sample belongs to, to speed up successive lookups in the folder
+        """
+        cache = self.provider.iocache
+        # objects with a custom local path (e.g. for --cache) have no cache key
+        if cache is None or self._overwrite_local_path is not None:
+            return None
 
-        return False
+        self._inventory()
+        if self.provider._is_inventorized(self):
+            return cache
+        return None
 
     def get_inventory_parent(self) -> Optional[str]:
         """Return the parent directory of this object."""
-        return posixpath.dirname(self.key)
+        return self.cache_key(self.bucket)
 
     def local_suffix(self) -> str:
         return self._local_suffix
@@ -305,7 +366,10 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
     # Fallible methods should implement some retry logic.
     # Here we simply rely on botos retry logic.
     def exists(self) -> bool:
-        # return True if the object exists
+        cache = self._get_cache()
+        if cache is not None:
+            return cache.exists_in_storage.get(self.cache_key(), False)
+
         try:
             self.s3obj().load()
         except botocore.exceptions.ClientError as e:
@@ -327,6 +391,12 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     def mtime(self) -> float:
         # return the modification time
+        cache = self._get_cache()
+        if cache is not None:
+            mtime = cache.mtime.get(self.cache_key())
+            if mtime is not None and mtime.storage() is not None:
+                return mtime.storage()
+
         if self.is_dir():
             return max(item.last_modified.timestamp() for item in self.get_subkeys())
         else:
@@ -334,6 +404,12 @@ class StorageObject(StorageObjectRead, StorageObjectWrite, StorageObjectGlob):
 
     def size(self) -> int:
         # return the size in bytes
+        cache = self._get_cache()
+        if cache is not None:
+            size = cache.size.get(self.cache_key())
+            if size is not None:
+                return size
+
         if self.is_dir():
             return sum(item.size for item in self.get_subkeys())
         else:
